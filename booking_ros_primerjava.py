@@ -6,6 +6,7 @@ import unicodedata
 from datetime import datetime
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="Booking.com vs ROS PMS", layout="wide")
@@ -137,6 +138,49 @@ def build_xlsx_export(df: pd.DataFrame) -> bytes:
     warn_fill = PatternFill(start_color="FCE8B2", end_color="FCE8B2", fill_type="solid")
     missing_fill = PatternFill(start_color="F8D0D0", end_color="F8D0D0", fill_type="solid")
 
+def sanitize_excel_value(v):
+    """Pretvori pandas/numpy vrednosti v čiste Python tipe, ki jih openpyxl
+    zna zapisati (numpy.bool_, numpy.int64, numpy.float64, NaN, NaT ...)."""
+    if v is None:
+        return None
+    if isinstance(v, np.generic):
+        v = v.item()  # numpy skalar -> native python (int/float/bool)
+    if isinstance(v, pd.Timestamp):
+        return None if pd.isna(v) else v.to_pydatetime()
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    if isinstance(v, bool):
+        return v
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (frozenset, set)):
+        return ", ".join(sorted(str(x) for x in v))
+    if not isinstance(v, (str, int, float, bool, datetime)):
+        return str(v)
+    return v
+
+
+def build_xlsx_export(df: pd.DataFrame) -> bytes:
+    """Izdela formatiran .xlsx (Arial pisava, obarvani status, denarni format
+    na EUR stolpcih, zamrznjena glava, avtomatska širina stolpcev)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Primerjava"
+
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    normal_font = Font(name="Arial", size=10)
+    ok_fill = PatternFill(start_color="D9F2D9", end_color="D9F2D9", fill_type="solid")
+    warn_fill = PatternFill(start_color="FCE8B2", end_color="FCE8B2", fill_type="solid")
+    missing_fill = PatternFill(start_color="F8D0D0", end_color="F8D0D0", fill_type="solid")
+
     columns = list(df.columns)
     ws.append(columns)
     for col_idx, _ in enumerate(columns, start=1):
@@ -149,12 +193,7 @@ def build_xlsx_export(df: pd.DataFrame) -> bytes:
     status_col_idx = columns.index("Status") + 1 if "Status" in columns else None
 
     for _, row in df.iterrows():
-        values = []
-        for col in columns:
-            v = row[col]
-            if isinstance(v, float) and pd.isna(v):
-                v = None
-            values.append(v)
+        values = [sanitize_excel_value(row[col]) for col in columns]
         ws.append(values)
         r = ws.max_row
         status_val = str(row.get("Status", ""))
@@ -222,9 +261,8 @@ def load_ros_df(file_bytes: bytes) -> pd.DataFrame:
     raw["Promet_num"] = raw["Promet"].apply(parse_sl_number)
     raw["Referenca"] = raw["Referenca"].astype(str).str.strip()
 
-    group_cols = ["Rezervacija"]
     rows = []
-    for rez, g in raw.groupby(group_cols, dropna=False):
+    for rez, g in raw.groupby("Rezervacija", dropna=False):
         # Promet je včasih podvojen na več vrsticah iste rezervacije
         # (isti znesek, različne vrstice/dolocila) - v tem primeru ga ne
         # seštevamo, sicer pa seštejemo, ker gre za dejansko ločene postavke.
