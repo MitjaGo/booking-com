@@ -111,6 +111,87 @@ def file_hash(uploaded_file) -> str:
     return h
 
 
+MONEY_COLUMNS = {
+    "Promet (ROS)", "Dodatek (ROS)", "Skupaj ROS", "Final amount (BC)",
+    "Razlika (Skupaj ROS - Final)", "Provizija znesek (BC)",
+    "Provizija pričakovana", "Razlika provizije", "Neto znesek (Final - Provizija)",
+}
+PERCENT_COLUMNS = {"Provizija %"}
+
+
+def build_xlsx_export(df: pd.DataFrame) -> bytes:
+    """Izdela formatiran .xlsx (Arial pisava, obarvani status, denarni format
+    na EUR stolpcih, zamrznjena glava, avtomatska širina stolpcev)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Primerjava"
+
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    normal_font = Font(name="Arial", size=10)
+    ok_fill = PatternFill(start_color="D9F2D9", end_color="D9F2D9", fill_type="solid")
+    warn_fill = PatternFill(start_color="FCE8B2", end_color="FCE8B2", fill_type="solid")
+    missing_fill = PatternFill(start_color="F8D0D0", end_color="F8D0D0", fill_type="solid")
+
+    columns = list(df.columns)
+    ws.append(columns)
+    for col_idx, _ in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.freeze_panes = "A2"
+
+    status_col_idx = columns.index("Status") + 1 if "Status" in columns else None
+
+    for _, row in df.iterrows():
+        values = []
+        for col in columns:
+            v = row[col]
+            if isinstance(v, float) and pd.isna(v):
+                v = None
+            values.append(v)
+        ws.append(values)
+        r = ws.max_row
+        status_val = str(row.get("Status", ""))
+        if status_val.startswith("❌"):
+            row_fill = missing_fill
+        elif "Ne štima" in status_val:
+            row_fill = warn_fill
+        elif status_val.startswith("✅") or "OK" in status_val:
+            row_fill = ok_fill
+        else:
+            row_fill = None
+
+        for col_idx, col in enumerate(columns, start=1):
+            cell = ws.cell(row=r, column=col_idx)
+            cell.font = normal_font
+            if row_fill is not None:
+                cell.fill = row_fill
+            if col in MONEY_COLUMNS and isinstance(cell.value, (int, float)):
+                cell.number_format = '#,##0.00 "€"'
+            elif col in PERCENT_COLUMNS and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00"
+
+    # avtomatska (približna) širina stolpcev
+    for col_idx, col in enumerate(columns, start=1):
+        max_len = len(str(col))
+        for val in df[col]:
+            max_len = max(max_len, len(str(val)) if val is not None else 0)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 45)
+
+    ws.auto_filter.ref = ws.dimensions
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Obdelava podatkov
 # ---------------------------------------------------------------------------
@@ -509,12 +590,12 @@ st.dataframe(
     },
 )
 
-csv_export = display_df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+xlsx_export = build_xlsx_export(display_df)
 st.download_button(
-    "⬇️ Prenesi primerjalno tabelo (CSV)",
-    data=csv_export,
-    file_name="primerjava_booking_ros.csv",
-    mime="text/csv",
+    "⬇️ Prenesi primerjalno tabelo (Excel .xlsx)",
+    data=xlsx_export,
+    file_name="primerjava_booking_ros.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
 st.divider()
