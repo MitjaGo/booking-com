@@ -2,6 +2,7 @@ import io
 import re
 import csv
 import hashlib
+import unicodedata
 from datetime import datetime
 
 import pandas as pd
@@ -12,6 +13,28 @@ st.set_page_config(page_title="Booking.com vs ROS PMS", layout="wide")
 # ---------------------------------------------------------------------------
 # Pomožne funkcije za branje in čiščenje podatkov
 # ---------------------------------------------------------------------------
+
+def normalize_name_tokens(name) -> frozenset:
+    """Iz imena naredi normaliziran nabor besed (brez šumnikov, ločil, velikih
+    črk) - uporabno za ujemanje ne glede na vrstni red (Ime Priimek vs
+    Priimek Ime) in drobne razlike v zapisu."""
+    if name is None:
+        return frozenset()
+    s = str(name).upper()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^A-Z\s]", " ", s)
+    tokens = {t for t in s.split() if len(t) > 1}
+    return frozenset(tokens)
+
+
+def name_match_score(tokens_a: frozenset, tokens_b: frozenset) -> float:
+    """Delež ujemajočih se besed glede na manjši od obeh naborov (0-1)."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    common = tokens_a & tokens_b
+    return len(common) / min(len(tokens_a), len(tokens_b))
+
 
 def parse_ros_csv(file_bytes: bytes) -> pd.DataFrame:
     """Prebere ROS PMS CSV izvoz (';'-ločen, cp1250, lahko vsebuje
@@ -161,22 +184,86 @@ def load_ros_df(file_bytes: bytes) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, tolerance: float) -> pd.DataFrame:
-    ros_valid = ros_df[ros_df["Referenca"] != ""].copy()
+def match_reservations(bc_df: pd.DataFrame, ros_df: pd.DataFrame, name_match_threshold: float = 0.6):
+    """Poveže vsako Booking.com rezervacijo z ROS rezervacijo v dveh korakih:
+    1. po Referenci (natančno ujemanje Reservation number = Referenca)
+    2. za tiste, ki jih ni bilo mogoče najti po referenci, poskusi ujemanje
+       po imenu/priimku gosta (normalizirano, brez šumnikov, ne glede na
+       vrstni red besed) med še nezasedenimi ROS vrsticami.
+    Vrne DataFrame enake dolžine kot bc_df s stolpci '_ros_match_idx' in
+    'Nacin_ujemanja' ('referenca' / 'ime' / None)."""
 
-    merged = bc_df.merge(
-        ros_valid,
-        left_on="Reservation number",
-        right_on="Referenca",
-        how="left",
-        suffixes=("", "_ros"),
-    )
+    bc_df = bc_df.reset_index(drop=True).copy()
+    ros_df = ros_df.reset_index(drop=True).copy()
+
+    bc_df["_name_tokens"] = bc_df["Guest name"].apply(normalize_name_tokens)
+    ros_df["_name_tokens"] = ros_df["Gost_ROS"].apply(normalize_name_tokens)
+
+    ref_to_indices = {}
+    for idx, ref in ros_df["Referenca"].items():
+        if ref:
+            ref_to_indices.setdefault(ref, []).append(idx)
+
+    match_idx = [None] * len(bc_df)
+    match_type = [None] * len(bc_df)
+    used_ros = set()
+
+    # 1. korak: ujemanje po referenci
+    for bidx, resnum in bc_df["Reservation number"].items():
+        candidates = [c for c in ref_to_indices.get(resnum, []) if c not in used_ros]
+        if candidates:
+            match_idx[bidx] = candidates[0]
+            match_type[bidx] = "referenca"
+            used_ros.add(candidates[0])
+
+    # 2. korak: ujemanje po imenu za tiste, ki jih referenca ni razrešila
+    for bidx in bc_df.index:
+        if match_idx[bidx] is not None:
+            continue
+        b_tokens = bc_df.at[bidx, "_name_tokens"]
+        if not b_tokens:
+            continue
+        best_idx, best_score = None, 0.0
+        for ridx in ros_df.index:
+            if ridx in used_ros:
+                continue
+            r_tokens = ros_df.at[ridx, "_name_tokens"]
+            score = name_match_score(b_tokens, r_tokens)
+            if score > best_score:
+                best_score, best_idx = score, ridx
+        if best_idx is not None and best_score >= name_match_threshold:
+            match_idx[bidx] = best_idx
+            match_type[bidx] = "ime"
+            used_ros.add(best_idx)
+
+    bc_df["_ros_match_idx"] = match_idx
+    bc_df["Nacin_ujemanja"] = match_type
+    return bc_df, ros_df
+
+
+def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, tolerance: float) -> pd.DataFrame:
+    bc_matched, ros_indexed = match_reservations(bc_df, ros_df)
+
+    ros_cols = [
+        "Rezervacija_ROS", "Referenca", "Naziv skupine", "Gost_ROS", "Tip prostora",
+        "Zacetek_ROS", "Konec_ROS", "Nights_ROS", "Cena_ROS", "Promet_ROS", "St_vrstic",
+    ]
+
+    def get_field(ridx, col):
+        if ridx is None or pd.isna(ridx):
+            return None
+        return ros_indexed.at[int(ridx), col]
+
+    for col in ros_cols:
+        bc_matched[col] = bc_matched["_ros_match_idx"].apply(lambda ridx, c=col: get_field(ridx, c))
+
+    merged = bc_matched
 
     merged["Dodatek_ROS"] = merged["Reservation number"].map(
         lambda r: dodatki.get(r, 0.0)
     ).fillna(0.0)
 
-    merged["V_ROS_najdeno"] = merged["Rezervacija_ROS"].notna()
+    merged["V_ROS_najdeno"] = merged["_ros_match_idx"].notna()
 
     merged["Skupaj_ROS"] = merged["Promet_ROS"].fillna(0.0) + merged["Dodatek_ROS"]
 
@@ -203,7 +290,7 @@ def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, t
 
     def status(row):
         if not row["V_ROS_najdeno"]:
-            return "❌ Ni v ROS"
+            return "❌ Ni v ROS (niti po referenci niti po imenu)"
         probs = []
         if not row["Datumi_OK"]:
             probs.append("datumi")
@@ -211,11 +298,12 @@ def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, t
             probs.append("znesek (manjka promet v ROS)")
         if not row["Provizija_OK"]:
             probs.append("provizija")
+        prefix = "🟡 (ujemanje po imenu, ne po referenci) " if row["Nacin_ujemanja"] == "ime" else ""
         if probs:
-            return "⚠️ Ne štima: " + ", ".join(probs)
+            return prefix + "⚠️ Ne štima: " + ", ".join(probs)
         if row["Podaljsano_placano_v_ROS"]:
-            return "✅ OK (podaljšano bivanje - gost je razliko že plačal v ROS, brez provizije)"
-        return "✅ OK"
+            return prefix + "✅ OK (podaljšano bivanje - gost je razliko že plačal v ROS, brez provizije)"
+        return prefix + "✅ OK"
 
     merged["Status"] = merged.apply(status, axis=1)
     return merged
@@ -363,13 +451,20 @@ st.subheader("📋 Primerjalna tabela")
 display_df = comparison.copy()
 display_df["Arrival"] = display_df["Arrival"].dt.strftime("%d.%m.%Y")
 display_df["Departure"] = display_df["Departure"].dt.strftime("%d.%m.%Y")
-display_df["Zacetek_ROS"] = display_df["Zacetek_ROS"].dt.strftime("%d.%m.%Y")
-display_df["Konec_ROS"] = display_df["Konec_ROS"].dt.strftime("%d.%m.%Y")
+display_df["Zacetek_ROS"] = pd.to_datetime(display_df["Zacetek_ROS"], errors="coerce").dt.strftime("%d.%m.%Y")
+display_df["Konec_ROS"] = pd.to_datetime(display_df["Konec_ROS"], errors="coerce").dt.strftime("%d.%m.%Y")
+display_df["Nacin_ujemanja"] = display_df["Nacin_ujemanja"].map({
+    "referenca": "po referenci",
+    "ime": "po imenu (preveri ročno!)",
+}).fillna("ni najdeno")
 
 cols_map = {
     "Reservation number": "Rezervacija (Booking.com)",
     "Guest name": "Gost",
     "Status": "Status",
+    "Nacin_ujemanja": "Način ujemanja",
+    "Rezervacija_ROS": "Rezervacija (ROS)",
+    "Gost_ROS": "Gost (ROS)",
     "Arrival": "Prihod (BC)",
     "Departure": "Odhod (BC)",
     "Nights_BC": "Noči (BC)",
