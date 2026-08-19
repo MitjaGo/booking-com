@@ -181,7 +181,13 @@ def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, t
     merged["Skupaj_ROS"] = merged["Promet_ROS"].fillna(0.0) + merged["Dodatek_ROS"]
 
     merged["Razlika_znesek"] = merged["Skupaj_ROS"] - merged["Final amount"]
-    merged["Znesek_OK"] = merged["V_ROS_najdeno"] & (merged["Razlika_znesek"].abs() <= tolerance)
+    # Znesek je problematičen SAMO, če je ROS znesek NIŽJI od Final amount
+    # (torej v ROS manjka promet). Če je ROS znesek VIŠJI, to praviloma pomeni,
+    # da je gost podaljšal bivanje in razliko ŽE PLAČAL neposredno v ROS
+    # (mimo Booking.com) - gost ničesar ne dolguje, plačilo je že prejeto.
+    # Booking.com od te razlike ne zaračuna provizije, ker ni šla skozi njih.
+    merged["Znesek_OK"] = merged["V_ROS_najdeno"] & (merged["Razlika_znesek"] >= -tolerance)
+    merged["Podaljsano_placano_v_ROS"] = merged["V_ROS_najdeno"] & (merged["Razlika_znesek"] > tolerance)
 
     merged["Datumi_OK"] = (
         merged["V_ROS_najdeno"]
@@ -202,11 +208,13 @@ def build_comparison(bc_df: pd.DataFrame, ros_df: pd.DataFrame, dodatki: dict, t
         if not row["Datumi_OK"]:
             probs.append("datumi")
         if not row["Znesek_OK"]:
-            probs.append("znesek")
+            probs.append("znesek (manjka promet v ROS)")
         if not row["Provizija_OK"]:
             probs.append("provizija")
         if probs:
             return "⚠️ Ne štima: " + ", ".join(probs)
+        if row["Podaljsano_placano_v_ROS"]:
+            return "✅ OK (podaljšano bivanje - gost je razliko že plačal v ROS, brez provizije)"
         return "✅ OK"
 
     merged["Status"] = merged.apply(status, axis=1)
@@ -278,14 +286,22 @@ comparison = build_comparison(bc_df, ros_df, dodatki, tolerance)
 total_bc = len(comparison)
 found_in_ros = int(comparison["V_ROS_najdeno"].sum())
 not_found = total_bc - found_in_ros
-ok_count = int((comparison["Status"] == "✅ OK").sum())
-mismatch_count = total_bc - ok_count - not_found
+ok_count = int(comparison["Status"].str.startswith("✅").sum())
+extended_count = int(comparison["Podaljsano_placano_v_ROS"].sum())
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Rezervacij v Booking.com", total_bc)
 c2.metric("Najdenih v ROS", found_in_ros)
-c3.metric("✅ Ujemajo se v celoti", ok_count)
+c3.metric("✅ Ujemajo se / OK", ok_count)
 c4.metric("⚠️ Ne štima / manjka", total_bc - ok_count)
+
+if extended_count:
+    st.caption(
+        f"ℹ️ Pri {extended_count} rezervacijah je ROS znesek višji od Final amount "
+        "(gost je verjetno podaljšal bivanje in razliko že plačal neposredno v ROS, "
+        "mimo Booking.com) - to je označeno kot OK, gost ničesar ne dolguje, "
+        "provizija se od te razlike ne obračunava."
+    )
 
 st.divider()
 
@@ -334,7 +350,7 @@ for _, r in edited.iterrows():
 if changed:
     st.session_state[data_key] = dodatki
     comparison = build_comparison(bc_df, ros_df, dodatki, tolerance)
-    ok_count = int((comparison["Status"] == "✅ OK").sum())
+    ok_count = int(comparison["Status"].str.startswith("✅").sum())
 
 st.divider()
 
@@ -368,6 +384,7 @@ cols_map = {
     "Final amount": "Final amount (BC)",
     "Razlika_znesek": "Razlika (Skupaj ROS - Final)",
     "Znesek_OK": "Znesek OK?",
+    "Podaljsano_placano_v_ROS": "Podaljšano bivanje - že plačano v ROS?",
     "Commission %": "Provizija %",
     "Commission amount": "Provizija znesek (BC)",
     "Provizija_pricakovana": "Provizija pričakovana",
